@@ -385,6 +385,11 @@ xmpp_ctx_t *xmpp_conn_get_context(xmpp_conn_t *conn);
 int xmpp_conn_is_secured(xmpp_conn_t *conn);
 void xmpp_conn_set_sockopt_callback(xmpp_conn_t *conn,
                                     xmpp_sockopt_callback callback);
+void xmpp_conn_set_proxy(xmpp_conn_t *conn,
+                         const char *host,
+                         unsigned short port,
+                         const char *user,
+                         const char *pass);
 int xmpp_conn_is_connecting(xmpp_conn_t *conn);
 int xmpp_conn_is_connected(xmpp_conn_t *conn);
 int xmpp_conn_is_disconnected(xmpp_conn_t *conn);
