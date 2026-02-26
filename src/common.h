@@ -133,6 +133,7 @@ void strophe_log_internal(const xmpp_ctx_t *ctx,
 typedef enum {
     XMPP_STATE_DISCONNECTED,
     XMPP_STATE_CONNECTING,
+    XMPP_STATE_PROXY_CONNECTING,
     XMPP_STATE_CONNECTED
 } xmpp_conn_state_t;
 
@@ -283,6 +284,18 @@ struct _xmpp_conn_t {
     hash_t *id_handlers;
     xmpp_handlist_t *handlers;
     xmpp_sockopt_callback sockopt_cb;
+
+    /* HTTP CONNECT proxy */
+    char *proxy_host;
+    unsigned short proxy_port;
+    char *proxy_user;
+    char *proxy_pass;
+    char *proxy_target_host;
+    unsigned short proxy_target_port;
+    char proxy_buf[512];
+    size_t proxy_buflen;
+    int proxy_request_sent;
+    size_t proxy_request_written;
 };
 
 void conn_disconnect(xmpp_conn_t *conn);

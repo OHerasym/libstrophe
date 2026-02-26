@@ -138,17 +138,37 @@ xmpp_sock_t *sock_new(xmpp_conn_t *conn,
     xsock->host = NULL;
     xsock->port = 0;
 
-    if (!host) {
-        found = resolver_srv_lookup(ctx, "xmpp-client", "tcp", domain,
-                                    &xsock->srv_rr_list);
-        if (XMPP_DOMAIN_NOT_FOUND == found)
-            strophe_debug(ctx, "sock",
-                          "SRV lookup failed, connecting via domain.");
-    }
-    if (XMPP_DOMAIN_NOT_FOUND == found) {
-        /* Resolution failed or the host is provided explicitly. */
+    if (conn->proxy_host) {
+        /* When proxy is configured, connect to the proxy server instead.
+         * Save the original target for the CONNECT request. */
+        strophe_free_and_null(ctx, conn->proxy_target_host);
+        conn->proxy_target_host =
+            strophe_strdup(ctx, host ? host : domain);
+        if (!conn->proxy_target_host) {
+            strophe_free(ctx, xsock);
+            return NULL;
+        }
+        conn->proxy_target_port = port;
+
         xsock->srv_rr_list =
-            resolver_srv_rr_new(ctx, host ? host : domain, port, 0, 0);
+            resolver_srv_rr_new(ctx, conn->proxy_host, conn->proxy_port, 0, 0);
+        strophe_debug(ctx, "sock",
+                      "Proxy configured, resolving %s:%u instead of %s:%u",
+                      conn->proxy_host, conn->proxy_port,
+                      conn->proxy_target_host, conn->proxy_target_port);
+    } else {
+        if (!host) {
+            found = resolver_srv_lookup(ctx, "xmpp-client", "tcp", domain,
+                                        &xsock->srv_rr_list);
+            if (XMPP_DOMAIN_NOT_FOUND == found)
+                strophe_debug(ctx, "sock",
+                              "SRV lookup failed, connecting via domain.");
+        }
+        if (XMPP_DOMAIN_NOT_FOUND == found) {
+            /* Resolution failed or the host is provided explicitly. */
+            xsock->srv_rr_list =
+                resolver_srv_rr_new(ctx, host ? host : domain, port, 0, 0);
+        }
     }
     xsock->srv_rr_cur = xsock->srv_rr_list;
 

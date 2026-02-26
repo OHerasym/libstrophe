@@ -243,6 +243,43 @@ void xmpp_conn_set_sockopt_callback(xmpp_conn_t *conn,
         callback(conn, &conn->sock);
 }
 
+/** Set HTTP CONNECT proxy for the connection.
+ *  When set, the library will connect to the proxy server first, perform
+ *  an HTTP CONNECT handshake to tunnel to the XMPP server, and then
+ *  proceed with TLS and XMPP stream negotiation through the tunnel.
+ *
+ *  This must be called before xmpp_connect_client().
+ *
+ *  @param conn a Strophe connection object
+ *  @param host the proxy server hostname or IP
+ *  @param port the proxy server port
+ *  @param user the proxy username, or NULL if no authentication required
+ *  @param pass the proxy password, or NULL if no authentication required
+ *
+ *  @ingroup Connections
+ */
+void xmpp_conn_set_proxy(xmpp_conn_t *conn,
+                         const char *host,
+                         unsigned short port,
+                         const char *user,
+                         const char *pass)
+{
+    strophe_free_and_null(conn->ctx, conn->proxy_host);
+    strophe_free_and_null(conn->ctx, conn->proxy_user);
+    strophe_free_and_null(conn->ctx, conn->proxy_pass);
+
+    if (host) {
+        conn->proxy_host = strophe_strdup(conn->ctx, host);
+        conn->proxy_port = port;
+        if (user)
+            conn->proxy_user = strophe_strdup(conn->ctx, user);
+        if (pass)
+            conn->proxy_pass = strophe_strdup(conn->ctx, pass);
+    } else {
+        conn->proxy_port = 0;
+    }
+}
+
 /** Release a Strophe connection object.
  *  Decrement the reference count by one for a connection, freeing the
  *  connection object if the count reaches 0.
@@ -268,6 +305,7 @@ int xmpp_conn_release(xmpp_conn_t *conn)
         ctx = conn->ctx;
 
         if (conn->state == XMPP_STATE_CONNECTING ||
+            conn->state == XMPP_STATE_PROXY_CONNECTING ||
             conn->state == XMPP_STATE_CONNECTED) {
             conn_disconnect(conn);
         }
@@ -358,6 +396,10 @@ int xmpp_conn_release(xmpp_conn_t *conn)
         if (conn->sm_state)
             xmpp_free_sm_state(conn->sm_state);
         tls_clear_password_cache(conn);
+        strophe_free_and_null(ctx, conn->proxy_host);
+        strophe_free_and_null(ctx, conn->proxy_user);
+        strophe_free_and_null(ctx, conn->proxy_pass);
+        strophe_free_and_null(ctx, conn->proxy_target_host);
         sock_free(conn->xsock);
         strophe_free(ctx, conn);
         released = 1;
@@ -960,8 +1002,16 @@ void conn_parser_reset(xmpp_conn_t *conn)
 void xmpp_disconnect(xmpp_conn_t *conn)
 {
     if (conn->state != XMPP_STATE_CONNECTING &&
+        conn->state != XMPP_STATE_PROXY_CONNECTING &&
         conn->state != XMPP_STATE_CONNECTED)
         return;
+
+    /* In connecting/proxy states, stream isn't open yet, just disconnect */
+    if (conn->state == XMPP_STATE_CONNECTING ||
+        conn->state == XMPP_STATE_PROXY_CONNECTING) {
+        conn_disconnect(conn);
+        return;
+    }
 
     /* close the stream */
     send_raw_string(conn, "</stream:stream>");
@@ -1183,6 +1233,7 @@ int xmpp_conn_is_secured(xmpp_conn_t *conn)
 int xmpp_conn_is_connecting(xmpp_conn_t *conn)
 {
     return conn->state == XMPP_STATE_CONNECTING ||
+           conn->state == XMPP_STATE_PROXY_CONNECTING ||
            (conn->state == XMPP_STATE_CONNECTED &&
             conn->stream_negotiation_completed == 0);
 }
@@ -1773,6 +1824,12 @@ static void _conn_reset(xmpp_conn_t *conn)
     conn->session_required = 0;
 
     handler_system_delete_all(conn);
+
+    conn->proxy_buflen = 0;
+    conn->proxy_request_sent = 0;
+    conn->proxy_request_written = 0;
+    strophe_free_and_null(ctx, conn->proxy_target_host);
+    conn->proxy_target_port = 0;
 }
 
 static int _conn_connect(xmpp_conn_t *conn,

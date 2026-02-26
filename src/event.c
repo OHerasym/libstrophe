@@ -63,6 +63,82 @@
 #define STROPHE_MESSAGE_BUFFER_SIZE 4096
 #endif
 
+/* Build HTTP CONNECT request into conn->proxy_buf.
+ * Returns length of request, or -1 on error. */
+static int _proxy_build_request(xmpp_conn_t *conn)
+{
+    char auth_hdr[1024] = "";
+
+    if (conn->proxy_user && conn->proxy_pass) {
+        char cred[512];
+        char *b64;
+        int credlen;
+
+        credlen = strophe_snprintf(cred, sizeof(cred), "%s:%s",
+                                   conn->proxy_user, conn->proxy_pass);
+        if (credlen < 0 || (size_t)credlen >= sizeof(cred))
+            return -1;
+
+        b64 = xmpp_base64_encode(conn->ctx, (unsigned char *)cred, credlen);
+        if (!b64)
+            return -1;
+
+        int ahlen = strophe_snprintf(auth_hdr, sizeof(auth_hdr),
+                         "Proxy-Authorization: Basic %s\r\n", b64);
+        strophe_free(conn->ctx, b64);
+        if (ahlen < 0 || (size_t)ahlen >= sizeof(auth_hdr))
+            return -1;
+    }
+
+    int len = strophe_snprintf(
+        conn->proxy_buf, sizeof(conn->proxy_buf),
+        "CONNECT %s:%u HTTP/1.1\r\n"
+        "Host: %s:%u\r\n"
+        "%s"
+        "\r\n",
+        conn->proxy_target_host, conn->proxy_target_port,
+        conn->proxy_target_host, conn->proxy_target_port,
+        auth_hdr);
+    if (len < 0 || (size_t)len >= sizeof(conn->proxy_buf))
+        return -1;
+    return len;
+}
+
+/* Parse accumulated proxy response. Returns:
+ *  1 = success (got HTTP 200)
+ *  0 = incomplete (need more data)
+ * -1 = failure (non-200 or malformed)
+ */
+static int _proxy_parse_response(xmpp_conn_t *conn)
+{
+    char *end;
+
+    /* Look for end of HTTP headers */
+    end = strstr(conn->proxy_buf, "\r\n\r\n");
+    if (!end) {
+        if (conn->proxy_buflen >= sizeof(conn->proxy_buf) - 1)
+            return -1; /* buffer full, no headers end found */
+        return 0; /* incomplete */
+    }
+
+    /* Check for "HTTP/1.x 200" in the first line */
+    if (strncmp(conn->proxy_buf, "HTTP/1.", 7) != 0)
+        return -1;
+    if (conn->proxy_buflen < 12)
+        return -1;
+    if (strncmp(conn->proxy_buf + 8, " 200", 4) != 0) {
+        /* Extract status for logging: find first \r\n */
+        char *eol = strstr(conn->proxy_buf, "\r\n");
+        if (eol)
+            *eol = '\0';
+        strophe_error(conn->ctx, "xmpp",
+                      "Proxy CONNECT failed: %s", conn->proxy_buf);
+        return -1;
+    }
+
+    return 1;
+}
+
 static int _connect_next(xmpp_conn_t *conn)
 {
     sock_close(conn->sock);
@@ -235,6 +311,21 @@ next_item:
                 }
             }
             break;
+        case XMPP_STATE_PROXY_CONNECTING:
+            /* Timeout check */
+            if (time_elapsed(conn->timeout_stamp, time_stamp()) <=
+                conn->connect_timeout) {
+                if (!conn->proxy_request_sent)
+                    FD_SET(conn->sock, &wfds); /* need to send CONNECT */
+                else
+                    FD_SET(conn->sock, &rfds); /* waiting for response */
+            } else {
+                strophe_info(ctx, "xmpp",
+                             "Proxy CONNECT handshake timed out.");
+                conn->error = ETIMEDOUT;
+                conn_disconnect(conn);
+            }
+            break;
         case XMPP_STATE_CONNECTED:
             FD_SET(conn->sock, &rfds);
             if (conn->send_queue_len > 0)
@@ -301,11 +392,108 @@ next_item:
                     break;
                 }
 
-                conn->state = XMPP_STATE_CONNECTED;
-                strophe_debug(ctx, "xmpp", "connection successful");
-                conn_established(conn);
+                if (conn->proxy_host) {
+                    conn->state = XMPP_STATE_PROXY_CONNECTING;
+                    conn->proxy_buflen = 0;
+                    conn->proxy_request_sent = 0;
+                    conn->timeout_stamp = time_stamp();
+                    strophe_debug(ctx, "xmpp",
+                                  "Connected to proxy, starting CONNECT handshake");
+                } else {
+                    conn->state = XMPP_STATE_CONNECTED;
+                    strophe_debug(ctx, "xmpp", "connection successful");
+                    conn_established(conn);
+                }
             }
 
+            break;
+        case XMPP_STATE_PROXY_CONNECTING:
+            if (!conn->proxy_request_sent &&
+                FD_ISSET(conn->sock, &wfds)) {
+                /* Build request on first attempt (proxy_buflen == 0) */
+                if (conn->proxy_buflen == 0) {
+                    int reqlen = _proxy_build_request(conn);
+                    if (reqlen < 0) {
+                        strophe_error(ctx, "xmpp",
+                                      "Failed to build proxy CONNECT request");
+                        conn->error = XMPP_EINT;
+                        conn_disconnect(conn);
+                        break;
+                    }
+                    conn->proxy_buflen = (size_t)reqlen;
+                    conn->proxy_request_written = 0;
+                }
+                ret = sock_write(conn->sock,
+                                 conn->proxy_buf + conn->proxy_request_written,
+                                 conn->proxy_buflen - conn->proxy_request_written);
+                if (ret < 0 && !sock_is_recoverable(sock_error())) {
+                    strophe_error(ctx, "xmpp",
+                                  "Failed to send proxy CONNECT request");
+                    conn->error = sock_error();
+                    conn_disconnect(conn);
+                    break;
+                }
+                if (ret > 0) {
+                    conn->proxy_request_written += ret;
+                    if (conn->proxy_request_written >= conn->proxy_buflen) {
+                        conn->proxy_request_sent = 1;
+                        conn->proxy_buflen = 0;
+                        memset(conn->proxy_buf, 0, sizeof(conn->proxy_buf));
+                        strophe_debug(ctx, "xmpp",
+                                      "Proxy CONNECT request sent");
+                    }
+                }
+            }
+            if (conn->proxy_request_sent &&
+                FD_ISSET(conn->sock, &rfds)) {
+                /* Read proxy response */
+                size_t space =
+                    sizeof(conn->proxy_buf) - conn->proxy_buflen - 1;
+                if (space == 0) {
+                    strophe_error(ctx, "xmpp",
+                                  "Proxy response too large");
+                    conn->error = XMPP_EINT;
+                    conn_disconnect(conn);
+                    break;
+                }
+                ret = sock_read(conn->sock,
+                                conn->proxy_buf + conn->proxy_buflen,
+                                space);
+                if (ret > 0) {
+                    conn->proxy_buflen += ret;
+                    conn->proxy_buf[conn->proxy_buflen] = '\0';
+
+                    ret = _proxy_parse_response(conn);
+                    if (ret == 1) {
+                        /* Tunnel established */
+                        conn->state = XMPP_STATE_CONNECTED;
+                        strophe_debug(ctx, "xmpp",
+                                      "Proxy CONNECT successful, "
+                                      "tunnel established");
+                        conn_established(conn);
+                    } else if (ret == -1) {
+                        strophe_error(ctx, "xmpp",
+                                      "Proxy CONNECT handshake failed");
+                        conn->error = ECONNREFUSED;
+                        conn_disconnect(conn);
+                    }
+                    /* ret == 0: incomplete, continue reading */
+                } else if (ret == 0) {
+                    strophe_error(ctx, "xmpp",
+                                  "Proxy closed connection during "
+                                  "CONNECT handshake");
+                    conn->error = ECONNRESET;
+                    conn_disconnect(conn);
+                } else {
+                    if (!sock_is_recoverable(sock_error())) {
+                        strophe_error(ctx, "xmpp",
+                                      "Read error during proxy CONNECT: %d",
+                                      sock_error());
+                        conn->error = sock_error();
+                        conn_disconnect(conn);
+                    }
+                }
+            }
             break;
         case XMPP_STATE_CONNECTED:
             if (FD_ISSET(conn->sock, &rfds) ||
