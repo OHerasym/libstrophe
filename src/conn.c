@@ -1828,8 +1828,6 @@ static void _conn_reset(xmpp_conn_t *conn)
     conn->proxy_buflen = 0;
     conn->proxy_request_sent = 0;
     conn->proxy_request_written = 0;
-    strophe_free_and_null(ctx, conn->proxy_target_host);
-    conn->proxy_target_port = 0;
 }
 
 static int _conn_connect(xmpp_conn_t *conn,
